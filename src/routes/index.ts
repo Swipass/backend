@@ -18,7 +18,7 @@
  *   GET  /admin/bridges
  *   PUT  /admin/bridges/:name
  */
-import { FastifyInstance } from "fastify";
+import { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { SUPPORTED_CHAINS, SUPPORTED_TOKENS } from "../config/chains";
 import { buildQuote } from "../services/quote.service";
@@ -70,20 +70,21 @@ const FeeSchema = z.object({
 });
 
 // Helper: wrap async handlers with consistent error format
-function wrap(
-  fn: (req: Parameters<Parameters<FastifyInstance["post"]>[1]>[0], reply: Parameters<Parameters<FastifyInstance["post"]>[1]>[1]) => Promise<unknown>
-) {
-  return async (req: any, reply: any) => {
+function wrap(fn: (req: FastifyRequest, reply: FastifyReply) => Promise<any>) {
+  return async (req: FastifyRequest, reply: FastifyReply) => {
     try {
       return await fn(req, reply);
-    } catch (err: unknown) {
-      const e = err as Error;
-      logger.warn({ err: e.message, path: req.url }, "Request error");
-      const status = e.message.includes("not found") ? 404
-        : e.message.includes("expired") ? 422
-        : e.message.includes("already been used") ? 422
-        : 400;
-      return reply.status(status).send({ success: false, error: e.message });
+    } catch (err: any) {
+      const message = err?.message || "Internal error";
+      logger.warn({ err: message, path: req.url }, "Request error");
+
+      const status =
+        message.includes("not found") ? 404 :
+        message.includes("expired") ? 422 :
+        message.includes("already been used") ? 422 :
+        400;
+
+      return reply.status(status).send({ success: false, error: message });
     }
   };
 }
@@ -114,7 +115,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Quote ──────────────────────────────────────────────────
   app.post(
     "/v1/quote",
-    wrap(async (req: any, reply) => {
+    wrap(async (req, reply) => {
       const body = QuoteSchema.parse(req.body);
       const quote = await buildQuote({
         ...body,
@@ -127,7 +128,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Execute (build tx) ─────────────────────────────────────
   app.post(
     "/v1/execute",
-    wrap(async (req: any, reply) => {
+    wrap(async (req, reply) => {
       const body = ExecuteSchema.parse(req.body);
       const result = await prepareExecution({
         quoteId: body.quoteId,
@@ -141,9 +142,9 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Submit tx hash (after wallet signs) ────────────────────
   app.post(
     "/v1/execute/:id/tx-hash",
-    wrap(async (req: any, reply) => {
+    wrap(async (req, reply) => {
       const { txHash } = TxHashSchema.parse(req.body);
-      await submitTxHash(req.params.id, txHash);
+      await submitTxHash((req.params as any).id, txHash);
       return { success: true, message: "Tx hash recorded — tracking started" };
     })
   );
@@ -151,8 +152,8 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Get execution status ────────────────────────────────────
   app.get(
     "/v1/execute/:id",
-    wrap(async (req: any, reply) => {
-      const execution = await getExecution(req.params.id);
+    wrap(async (req, reply) => {
+      const execution = await getExecution((req.params as any).id);
       if (!execution) {
         return reply.status(404).send({ success: false, error: "Execution not found" });
       }
@@ -163,10 +164,14 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Execution history for a wallet ─────────────────────────
   app.get(
     "/v1/history/:address",
-    wrap(async (req: any) => {
-      const page = parseInt(req.query.page ?? "1");
-      const limit = Math.min(parseInt(req.query.limit ?? "20"), 50);
-      const result = await getExecutionsByAddress(req.params.address, page, limit);
+    wrap(async (req, reply) => {
+      const query = req.query as any;
+      const params = req.params as any;
+
+      const page = parseInt(query.page ?? "1");
+      const limit = Math.min(parseInt(query.limit ?? "20"), 50);
+
+      const result = await getExecutionsByAddress(params.address, page, limit);
       return { success: true, ...result };
     })
   );
@@ -178,7 +183,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // Login — no auth required (returns JWT)
   app.post(
     "/admin/auth/login",
-    wrap(async (req: any, reply) => {
+    wrap(async (req, reply) => {
       const { email, password } = req.body as { email: string; password: string };
       const admin = await adminLogin(email, password);
       if (!admin) {
@@ -196,35 +201,40 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.register(async (adminApp) => {
     adminApp.addHook("preHandler", requireAdmin);
 
-    adminApp.get("/admin/stats", wrap(async () => {
+    adminApp.get("/admin/stats", wrap(async (req, reply) => {
       const stats = await getDashboardStats();
       return { success: true, data: stats };
     }));
 
-    adminApp.get("/admin/executions", wrap(async (req: any) => {
-      const page = parseInt(req.query.page ?? "1");
-      const limit = Math.min(parseInt(req.query.limit ?? "20"), 100);
-      const result = await listExecutions(page, limit, req.query.status);
+    adminApp.get("/admin/executions", wrap(async (req, reply) => {
+      const query = req.query as any;
+
+      const page = parseInt(query.page ?? "1");
+      const limit = Math.min(parseInt(query.limit ?? "20"), 100);
+
+      const result = await listExecutions(page, limit, query.status);
       return { success: true, ...result };
     }));
 
-    adminApp.get("/admin/fees", wrap(async () => {
+    adminApp.get("/admin/fees", wrap(async (req, reply) => {
       return { success: true, data: await getFeeConfig() };
     }));
 
-    adminApp.put("/admin/fees", wrap(async (req: any, reply) => {
+    adminApp.put("/admin/fees", wrap(async (req, reply) => {
       const body = FeeSchema.parse(req.body);
       const updated = await updateFeeConfig(body);
       return { success: true, data: updated };
     }));
 
-    adminApp.get("/admin/bridges", wrap(async () => {
+    adminApp.get("/admin/bridges", wrap(async (req, reply) => {
       return { success: true, data: await getBridgeConfigs() };
     }));
 
-    adminApp.put("/admin/bridges/:name", wrap(async (req: any) => {
+    adminApp.put("/admin/bridges/:name", wrap(async (req, reply) => {
       const { isEnabled } = req.body as { isEnabled: boolean };
-      const updated = await updateBridgeConfig(req.params.name, isEnabled);
+      const params = req.params as any;
+
+      const updated = await updateBridgeConfig(params.name, isEnabled);
       return { success: true, data: updated };
     }));
   });
