@@ -1,0 +1,115 @@
+// =============================================================
+// IZIPASS v0.1 — Database Schema
+// Only what we need for the bridge to work + admin monitoring
+// =============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Admin users (auto-seeded on startup) ─────────────────────
+model Admin {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String   @default("Admin")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("admins")
+}
+
+// ── Quote: priced route from LI.FI ───────────────────────────
+model Quote {
+  id            String      @id
+  fromChainId   Int
+  toChainId     Int
+  fromChain     String
+  toChain       String
+  fromToken     String      // symbol, e.g. "USDC"
+  toToken       String
+  fromTokenAddr String      // contract address
+  toTokenAddr   String
+  fromAmount    String      // raw amount (wei / lamports)
+  toAmount      String      // expected output after fee
+  toAmountMin   String      // minimum output (slippage)
+  feePct        Float       // izipass fee percentage
+  feeAmount     String      // fee in output token units
+  estimatedTime Int         // seconds
+  aggregator    String      @default("lifi")
+  routeData     Json        // full LI.FI route for execution
+  expiresAt     DateTime
+  status        QuoteStatus @default(PENDING)
+  createdAt     DateTime    @default(now())
+
+  executions Execution[]
+
+  @@index([createdAt])
+  @@index([fromChain, toChain])
+  @@map("quotes")
+}
+
+enum QuoteStatus {
+  PENDING
+  EXECUTED
+  EXPIRED
+}
+
+// ── Execution: a user-initiated bridge transaction ───────────
+model Execution {
+  id               String          @id @default(uuid())
+  quoteId          String
+  quote            Quote           @relation(fields: [quoteId], references: [id])
+  userAddress      String          // who signed the tx
+  recipientAddress String          // who receives funds (may differ)
+  txHash           String?         // submitted by frontend after signing
+  status           ExecutionStatus @default(PENDING)
+  errorMessage     String?
+  completedAt      DateTime?
+  durationMs       Int?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([userAddress])
+  @@index([status])
+  @@index([createdAt])
+  @@map("executions")
+}
+
+enum ExecutionStatus {
+  PENDING   // tx built, waiting for user to sign
+  BRIDGING  // signed + broadcast, waiting for bridge
+  SUCCESS   // arrived at destination
+  FAILED    // bridge failed — funds still in user wallet
+  REFUNDED
+}
+
+// ── Fee configuration (editable from admin) ──────────────────
+model FeeConfig {
+  id           String   @id @default(uuid())
+  feePct       Float    @default(0.003)  // 0.3%
+  minFeePct    Float    @default(0.001)  // 0.1%
+  maxFeePct    Float    @default(0.005)  // 0.5%
+  isActive     Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
+  createdAt    DateTime @default(now())
+
+  @@map("fee_configs")
+}
+
+// ── Bridge on/off switch (admin can disable a bridge) ────────
+model BridgeConfig {
+  id        String   @id @default(uuid())
+  name      String   @unique   // e.g. "across", "stargate"
+  isEnabled Boolean  @default(true)
+  notes     String?
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@map("bridge_configs")
+}
