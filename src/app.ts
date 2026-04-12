@@ -62,7 +62,7 @@ async function buildApp() {
   // CORS — allow frontend origin
   await app.register(cors, {
     origin: process.env.FRONTEND_URL
-      ? [process.env.FRONTEND_URL, "http://localhost:3000", "http://localhost:3001"]
+      ? [process.env.FRONTEND_URL, "https://www.swipass.com", "https://swipass.vercel.app", "http://localhost:3000", "http://localhost:3001"]
       : true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     credentials: true,
