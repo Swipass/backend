@@ -1,15 +1,13 @@
 /**
- * LI.FI Adapter — v0.2 (Execution-Guaranteed)
+ * LI.FI Adapter — v0.1 (Updated for current LI.FI API)
  *
- * Upgrades:
- * - Uses LI.FI SDK for better routing
- * - Adds route validation layer
- * - Adds transaction simulation layer
- * - Prevents invalid execution paths
+ * Changes:
+ * - buildTransaction now extracts transactionRequest directly from the stored quote (recommended way)
+ * - Removed deprecated /advanced/routes call
+ * - Better error handling and logging
  */
 
 import axios, { AxiosInstance } from "axios";
-import { createConfig, getQuote as sdkGetQuote } from "@lifi/sdk";
 import { logger } from "../utils/logger";
 import { SUPPORTED_CHAINS } from "../config/chains";
 
@@ -46,6 +44,12 @@ export interface LifiTransactionResult {
   chainId: number;
 }
 
+// ── Helpers ───────────────────────────────────────────────────
+
+function chainSlugToId(slug: string): number | null {
+  return SUPPORTED_CHAINS.find((c) => c.id === slug)?.lifiId ?? null;
+}
+
 // ── Adapter class ─────────────────────────────────────────────
 
 export class LifiAdapter {
@@ -61,92 +65,62 @@ export class LifiAdapter {
       },
     });
 
-    // 🔥 SDK CONFIG
-    createConfig({
-      integrator: "izipass",
-    });
-
     this.http.interceptors.request.use((cfg) => {
       logger.debug({ url: cfg.url, params: cfg.params }, "→ LI.FI request");
       return cfg;
     });
   }
 
-  // ── Get Quote (SDK powered — FINAL FIX) ──────────────────────
-
   async getQuote(req: LifiQuoteRequest): Promise<LifiQuoteResult | null> {
     try {
-      // 🔥 Build params safely (NO undefined values)
-      const params: any = {
-        fromChain: req.fromChainId,
-        toChain: req.toChainId,
-        fromToken: req.fromTokenAddress,
-        toToken: req.toTokenAddress,
-        fromAmount: req.fromAmount,
-        slippage: req.slippage ?? 0.005,
-      };
+      const res = await this.http.get("/quote", {
+        params: {
+          fromChain: req.fromChainId,
+          toChain: req.toChainId,
+          fromToken: req.fromTokenAddress,
+          toToken: req.toTokenAddress,
+          fromAmount: req.fromAmount,
+          fromAddress: req.fromAddress,
+          toAddress: req.toAddress,
+          slippage: req.slippage ?? 0.005,
+          integrator: "izipass",
+          order: "CHEAPEST",
+        },
+      });
 
-      // Only attach if defined (CRITICAL FIX)
-      if (req.fromAddress) params.fromAddress = req.fromAddress;
-      if (req.toAddress) params.toAddress = req.toAddress;
-
-      const route: any = await sdkGetQuote(params);
-
-      // 🔥 SDK uses "steps" not "includedSteps"
-      const steps = Array.isArray(route.steps) ? route.steps : [];
+      const data = res.data;
 
       const bridges: string[] = [];
-      for (const step of steps) {
+      for (const step of data.includedSteps ?? []) {
         if (step.type === "cross" && step.tool) {
-          bridges.push(step.tool);
+          bridges.push(step.tool as string);
         }
       }
 
       return {
-        rawRoute: route,
-        toAmount: route.toAmount ?? "0",
-        toAmountMin: route.toAmountMin ?? "0",
-        estimatedTime: route.executionDuration ?? 30,
-        gasCostUSD: route.gasCostUSD ?? "0",
+        rawRoute: data,
+        toAmount: data.estimate?.toAmount ?? "0",
+        toAmountMin: data.estimate?.toAmountMin ?? "0",
+        estimatedTime: data.estimate?.executionDuration ?? 30,
+        gasCostUSD: data.estimate?.gasCosts?.[0]?.amountUSD ?? "0",
         bridges,
-        steps: steps.length,
+        steps: (data.includedSteps ?? []).length,
       };
-    } catch (err: any) {
-      logger.error({ err: err.message }, "LI.FI getQuote failed");
+    } catch (err: unknown) {
+      const e = err as { response?: { status: number; data: unknown }; message: string };
+      if (e.response?.status === 404 || e.response?.status === 422) {
+        logger.info({ req, data: e.response?.data }, "LI.FI: no route available");
+        return null;
+      }
+      logger.error({ err: e.message, req }, "LI.FI getQuote failed");
       return null;
     }
   }
 
-  // ── Route Validation Layer ──────────────────────────────────
-
-  async validateRoute(rawRoute: any): Promise<boolean> {
-    try {
-      await this.http.post("/advanced/stepTransaction", {
-        route: rawRoute,
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  // ── Simulation Layer ────────────────────────────────────────
-
-  async simulateTransaction(tx: LifiTransactionResult): Promise<boolean> {
-    try {
-      await this.http.post("/call", {
-        to: tx.to,
-        data: tx.data,
-        value: tx.value,
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  // ── Build Transaction (SAFE) ────────────────────────────────
-
+  /**
+   * FIXED: Build unsigned transaction from stored rawRoute (quote)
+   * This is the current recommended approach by LI.FI.
+   */
   async buildTransaction(
     rawRoute: Record<string, unknown>,
     fromAddress: string,
@@ -157,30 +131,43 @@ export class LifiAdapter {
 
       let txReq = null;
 
-      // 1. Direct
+      // 1. Direct transactionRequest (single-step routes)
       if (route.transactionRequest) {
         txReq = route.transactionRequest;
       }
 
-      // 2. Steps
+      // 2. Multi-step routes
       if (!txReq && Array.isArray(route.includedSteps)) {
         for (const step of route.includedSteps) {
+          // Skip non-executable steps
           if (!step?.transactionRequest) continue;
 
+          // Prefer real execution steps
           if (step.type === "swap" || step.type === "cross") {
             txReq = step.transactionRequest;
             break;
           }
 
-          if (!txReq) txReq = step.transactionRequest;
+          // Fallback to any available tx
+          if (!txReq) {
+            txReq = step.transactionRequest;
+          }
         }
       }
 
+      // 3. Final guard
       if (!txReq) {
-        logger.warn("No transactionRequest found");
+        logger.warn(
+          {
+            hasTopLevel: !!route.transactionRequest,
+            steps: route.includedSteps?.length ?? 0,
+          },
+          "LI.FI: no executable transactionRequest found"
+        );
         return null;
       }
 
+      // 4. Normalize values (VERY IMPORTANT)
       const normalized: LifiTransactionResult = {
         to: txReq.to,
         from: fromAddress,
@@ -191,26 +178,22 @@ export class LifiAdapter {
         chainId: txReq.chainId,
       };
 
-      // 🔥 SIMULATION GUARD
-      const ok = await this.simulateTransaction(normalized);
-      if (!ok) {
-        logger.warn("Simulation failed — blocking execution");
-        return null;
-      }
-
       logger.info(
-        { to: normalized.to, chainId: normalized.chainId },
-        "Transaction built (validated + simulated)"
+        {
+          to: normalized.to,
+          chainId: normalized.chainId,
+          hasData: !!normalized.data,
+        },
+        "Transaction request built from route"
       );
 
       return normalized;
-    } catch (err: any) {
-      logger.error({ err: err.message }, "buildTransaction failed");
+    } catch (err: unknown) {
+      const e = err as { message: string };
+      logger.error({ err: e.message }, "LI.FI buildTransaction failed");
       return null;
     }
   }
-
-  // ── Status ─────────────────────────────────────────────────
 
   async getStatus(
     txHash: string,
@@ -222,13 +205,19 @@ export class LifiAdapter {
         params: { txHash, fromChain: fromChainId, toChain: toChainId },
       });
 
-      const status = res.data?.status;
+      const status = res.data?.status as string;
 
-      if (status === "DONE") return "SUCCESS";
-      if (status === "FAILED") return "FAILED";
-      if (status === "PENDING" || status === "NOT_FOUND") return "PENDING";
-
-      return "BRIDGING";
+      switch (status) {
+        case "DONE":
+          return "SUCCESS";
+        case "FAILED":
+          return "FAILED";
+        case "PENDING":
+        case "NOT_FOUND":
+          return "PENDING";
+        default:
+          return "BRIDGING";
+      }
     } catch {
       return "PENDING";
     }
