@@ -1,10 +1,10 @@
 /**
- * LI.FI Adapter — v0.1 (Updated for current LI.FI API)
+ * LI.FI Adapter — v0.2 (Multi‑step support with /buildTx)
  *
  * Changes:
- * - buildTransaction now extracts transactionRequest directly from the stored quote (recommended way)
- * - Removed deprecated /advanced/routes call
- * - Better error handling and logging
+ * - Uses /buildTx endpoint to get fresh, correct transaction for each step.
+ * - getStatus now works for both approvals and bridges.
+ * - Added buildStepTransaction for individual steps.
  */
 
 import axios, { AxiosInstance } from "axios";
@@ -58,7 +58,7 @@ export class LifiAdapter {
   constructor() {
     this.http = axios.create({
       baseURL: process.env.LIFI_API_URL || "https://li.quest/v1",
-      timeout: 12_000,
+      timeout: 15_000,
       headers: {
         "Content-Type": "application/json",
         ...(process.env.LIFI_API_KEY ? { "x-lifi-api-key": process.env.LIFI_API_KEY } : {}),
@@ -83,7 +83,7 @@ export class LifiAdapter {
           fromAddress: req.fromAddress,
           toAddress: req.toAddress,
           slippage: req.slippage ?? 0.005,
-          integrator: "izipass",
+          integrator: "swipass",
           order: "CHEAPEST",
         },
       });
@@ -118,107 +118,63 @@ export class LifiAdapter {
   }
 
   /**
-   * FIXED: Build unsigned transaction from stored rawRoute (quote)
-   * This is the current recommended approach by LI.FI.
+   * Build transaction for a specific step using LI.FI's /buildTx endpoint.
+   * This ensures we get the exact, fresh transaction for the current step.
    */
-  async buildTransaction(
-    rawRoute: Record<string, unknown>,
+  async buildStepTransaction(
+    route: Record<string, unknown>,
+    stepIndex: number,
     fromAddress: string,
     toAddress: string
   ): Promise<LifiTransactionResult | null> {
     try {
-      const route = rawRoute as any;
+      const response = await this.http.post("/buildTx", {
+        route,
+        fromAddress,
+        toAddress,
+        step: stepIndex,    // LI.FI allows specifying which step to build
+        integrator: "swipass",
+      });
 
-      let txReq = null;
+      const tx = response.data.transactionRequest;
+      if (!tx) return null;
 
-      // 1. Direct transactionRequest (single-step routes)
-      if (route.transactionRequest) {
-        txReq = route.transactionRequest;
-      }
-
-      // 2. Multi-step routes
-      if (!txReq && Array.isArray(route.includedSteps)) {
-        for (const step of route.includedSteps) {
-          // Skip non-executable steps
-          if (!step?.transactionRequest) continue;
-
-          // Prefer real execution steps
-          if (step.type === "swap" || step.type === "cross") {
-            txReq = step.transactionRequest;
-            break;
-          }
-
-          // Fallback to any available tx
-          if (!txReq) {
-            txReq = step.transactionRequest;
-          }
-        }
-      }
-
-      // 3. Final guard
-      if (!txReq) {
-        logger.warn(
-          {
-            hasTopLevel: !!route.transactionRequest,
-            steps: route.includedSteps?.length ?? 0,
-          },
-          "LI.FI: no executable transactionRequest found"
-        );
-        return null;
-      }
-
-      // 4. Normalize values (VERY IMPORTANT)
-      const normalized: LifiTransactionResult = {
-        to: txReq.to,
+      return {
+        to: tx.to,
         from: fromAddress,
-        data: txReq.data,
-        value: txReq.value ?? "0x0",
-        gasLimit: txReq.gasLimit ?? "0x0",
-        gasPrice: txReq.gasPrice,
-        chainId: txReq.chainId,
+        data: tx.data,
+        value: tx.value ?? "0x0",
+        gasLimit: tx.gasLimit ?? "0x0",
+        gasPrice: tx.gasPrice,
+        chainId: tx.chainId,
       };
-
-      logger.info(
-        {
-          to: normalized.to,
-          chainId: normalized.chainId,
-          hasData: !!normalized.data,
-        },
-        "Transaction request built from route"
-      );
-
-      return normalized;
-    } catch (err: unknown) {
-      const e = err as { message: string };
-      logger.error({ err: e.message }, "LI.FI buildTransaction failed");
+    } catch (err: any) {
+      logger.error({ err: err.message, stepIndex }, "buildStepTransaction failed");
       return null;
     }
   }
 
-  async getStatus(
+  /**
+   * Check status of a specific step's transaction.
+   * For approvals, we just need to know if it's mined (success).
+   * For swaps/bridges, LI.FI returns DONE/FAILED.
+   */
+  async getStepStatus(
     txHash: string,
-    fromChainId: number,
-    toChainId: number
-  ): Promise<"PENDING" | "BRIDGING" | "SUCCESS" | "FAILED"> {
+    chainId: number,
+    stepType: string
+  ): Promise<"PENDING" | "CONFIRMED" | "SUCCESS" | "FAILED"> {
     try {
+      // For approvals, LI.FI's /status also works if we provide the same chain for both.
       const res = await this.http.get("/status", {
-        params: { txHash, fromChain: fromChainId, toChain: toChainId },
+        params: { txHash, fromChain: chainId, toChain: chainId },
       });
-
-      const status = res.data?.status as string;
-
-      switch (status) {
-        case "DONE":
-          return "SUCCESS";
-        case "FAILED":
-          return "FAILED";
-        case "PENDING":
-        case "NOT_FOUND":
-          return "PENDING";
-        default:
-          return "BRIDGING";
-      }
-    } catch {
+      const status = res.data?.status;
+      if (status === "DONE") return stepType === "approval" ? "CONFIRMED" : "SUCCESS";
+      if (status === "FAILED") return "FAILED";
+      return "PENDING";
+    } catch (err) {
+      // If LI.FI doesn't recognize it, assume still pending
       return "PENDING";
     }
   }

@@ -1,6 +1,5 @@
 // =============================================================
-// IZIPASS v0.1 — Database Schema
-// Only what we need for the bridge to work + admin monitoring
+// SWIPASS v0.2 — Database Schema (multi‑step support)
 // =============================================================
 
 generator client {
@@ -38,7 +37,7 @@ model Quote {
   fromAmount    String      // raw amount (wei / lamports)
   toAmount      String      // expected output after fee
   toAmountMin   String      // minimum output (slippage)
-  feePct        Float       // izipass fee percentage
+  feePct        Float       // swipass fee percentage
   feeAmount     String      // fee in output token units
   estimatedTime Int         // seconds
   aggregator    String      @default("lifi")
@@ -67,13 +66,15 @@ model Execution {
   quote            Quote           @relation(fields: [quoteId], references: [id])
   userAddress      String          // who signed the tx
   recipientAddress String          // who receives funds (may differ)
-  txHash           String?         // submitted by frontend after signing
+  currentStepIndex Int             @default(0)   // index of the step we are on
   status           ExecutionStatus @default(PENDING)
   errorMessage     String?
   completedAt      DateTime?
   durationMs       Int?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
+
+  steps Step[]
 
   @@index([userAddress])
   @@index([status])
@@ -82,11 +83,36 @@ model Execution {
 }
 
 enum ExecutionStatus {
-  PENDING   // tx built, waiting for user to sign
-  BRIDGING  // signed + broadcast, waiting for bridge
-  SUCCESS   // arrived at destination
-  FAILED    // bridge failed — funds still in user wallet
-  REFUNDED
+  PENDING   // waiting for user to sign next step
+  BRIDGING  // at least one step submitted, not finished
+  SUCCESS   // all steps done
+  FAILED    // a step failed
+}
+
+// ── Individual step inside an execution (approval, swap, cross) ──
+model Step {
+  id            String      @id @default(cuid())
+  executionId   String
+  execution     Execution   @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  stepIndex     Int         // 0, 1, 2...
+  type          String      // "approval", "swap", "cross"
+  status        StepStatus  @default(PENDING)
+  txHash        String?     // hash of the submitted transaction for this step
+  transactionRequest Json?   // the tx object LI.FI gave us (stored as JSON)
+  createdAt     DateTime    @default(now())
+  completedAt   DateTime?
+  errorMessage  String?
+
+  @@unique([executionId, stepIndex])
+  @@map("steps")
+}
+
+enum StepStatus {
+  PENDING      // waiting for user to sign & send
+  SUBMITTED    // tx hash received, waiting for confirmation
+  CONFIRMED    // tx confirmed on chain (but next step not yet started)
+  COMPLETED    // step fully done (if swap/cross) or just confirmed if approval
+  FAILED
 }
 
 // ── Fee configuration (editable from admin) ──────────────────

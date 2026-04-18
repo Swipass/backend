@@ -1,12 +1,13 @@
 /**
- * Route registrations — v0.1
+ * Route registrations — v0.2 (multi‑step support)
  *
  * Public routes  (no auth):
  *   GET  /health
  *   GET  /v1/chains
  *   POST /v1/quote
  *   POST /v1/execute
- *   POST /v1/execute/:id/tx-hash
+ *   POST /v1/execute/:id/submit-step
+ *   GET  /v1/execute/:id/next
  *   GET  /v1/execute/:id
  *
  * Admin routes  (JWT required):
@@ -24,7 +25,7 @@ import { SUPPORTED_CHAINS, SUPPORTED_TOKENS } from "../config/chains";
 import { buildQuote } from "../services/quote.service";
 import {
   prepareExecution,
-  submitTxHash,
+  submitStepTxHash,
   getExecution,
   getExecutionsByAddress,
 } from "../services/execution.service";
@@ -39,6 +40,7 @@ import {
 } from "../services/admin.service";
 import { requireAdmin } from "../middleware/auth";
 import { logger } from "../utils/logger";
+import { prisma } from "../lib/database";
 
 // ── Zod schemas ───────────────────────────────────────────────
 
@@ -94,7 +96,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   // ── Health ─────────────────────────────────────────────────
   app.get("/health", async () => ({
     status: "ok",
-    version: "0.1.0",
+    version: "0.2.0",
     timestamp: new Date().toISOString(),
   }));
 
@@ -125,7 +127,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     })
   );
 
-  // ── Execute (build tx) ─────────────────────────────────────
+  // ── Execute (create execution + first step) ─────────────────
   app.post(
     "/v1/execute",
     wrap(async (req, reply) => {
@@ -139,17 +141,60 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     })
   );
 
-  // ── Submit tx hash (after wallet signs) ────────────────────
+  // ── Submit tx hash for the current step ────────────────────
   app.post(
-    "/v1/execute/:id/tx-hash",
+    "/v1/execute/:id/submit-step",
     wrap(async (req, reply) => {
       const { txHash } = TxHashSchema.parse(req.body);
-      await submitTxHash((req.params as any).id, txHash);
-      return { success: true, message: "Tx hash recorded — tracking started" };
+      await submitStepTxHash((req.params as any).id, txHash);
+      return { success: true, message: "Step transaction recorded" };
     })
   );
 
-  // ── Get execution status ────────────────────────────────────
+  // ── Get the next pending transaction (or completion status) ─
+  app.get(
+    "/v1/execute/:id/next",
+    wrap(async (req, reply) => {
+      const executionId = (req.params as any).id;
+      const execution = await prisma.execution.findUnique({
+        where: { id: executionId },
+        include: { steps: { orderBy: { stepIndex: "asc" } } },
+      });
+      if (!execution) return reply.status(404).send({ success: false, error: "Not found" });
+
+      const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
+      if (!currentStep) {
+        // Should not happen, but means all steps are done
+        return reply.status(200).send({ success: true, data: { completed: true } });
+      }
+
+      if (currentStep.status === "PENDING") {
+        // Return the transaction again (in case frontend needs to re‑sign)
+        return reply.status(200).send({
+          success: true,
+          data: {
+            stepIndex: currentStep.stepIndex,
+            stepType: currentStep.type,
+            transactionRequest: currentStep.transactionRequest,
+          },
+        });
+      } else if (currentStep.status === "SUBMITTED" || currentStep.status === "CONFIRMED") {
+        return reply.status(200).send({
+          success: true,
+          data: { waitingForConfirmation: true, stepIndex: currentStep.stepIndex },
+        });
+      } else {
+        // Step is COMPLETED or FAILED – if completed, maybe all done
+        const allCompleted = execution.steps.every(s => s.status === "COMPLETED");
+        if (allCompleted || execution.status === "SUCCESS") {
+          return reply.status(200).send({ success: true, data: { completed: true } });
+        }
+        return reply.status(200).send({ success: true, data: { completed: false, error: currentStep.errorMessage } });
+      }
+    })
+  );
+
+  // ── Get full execution status (for status page) ────────────
   app.get(
     "/v1/execute/:id",
     wrap(async (req, reply) => {

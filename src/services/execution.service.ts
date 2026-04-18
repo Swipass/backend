@@ -1,13 +1,14 @@
 /**
- * Execution Service — handles the full bridge execution lifecycle.
+ * Execution Service — handles multi‑step bridge execution lifecycle.
  *
  * Flow:
- *   1. Frontend calls POST /execute → we build the tx and return it
- *   2. User signs in their wallet and broadcasts
- *   3. Frontend calls POST /execute/:id/tx-hash with the broadcast hash
- *   4. Background worker polls LI.FI until DONE or FAILED
+ *   1. Frontend calls POST /execute → creates execution + all steps, returns first tx.
+ *   2. User signs and broadcasts the tx.
+ *   3. Frontend calls POST /execute/:id/submit-step with tx hash.
+ *   4. Background worker polls each step, advances to next when confirmed.
+ *   5. Frontend polls GET /execute/:id/next to get the next pending transaction.
  */
-import { ExecutionStatus } from "@prisma/client";
+import { ExecutionStatus, StepStatus } from "@prisma/client";
 import { prisma } from "../lib/database";
 import { lifi } from "../adapters/lifi.adapter";
 import { logger } from "../utils/logger";
@@ -21,7 +22,8 @@ export interface ExecuteRequest {
 export interface ExecuteResponse {
   executionId: string;
   trackingUrl: string;
-  /** The unsigned transaction the user's wallet must sign & broadcast */
+  stepIndex: number;
+  stepType: string;
   transactionRequest: {
     to: string;
     from: string;
@@ -34,115 +36,244 @@ export interface ExecuteResponse {
 }
 
 /**
- * Build the transaction for the user to sign.
- * Prevents the same quote from being used more than once.
+ * Prepares the first pending step of an execution.
+ * If no execution exists, creates one and returns the first transaction.
  */
 export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResponse> {
-  // ── Load and validate quote ─────────────────────────────────
-  const quote = await prisma.quote.findUnique({ 
-    where: { id: req.quoteId } 
+  const quote = await prisma.quote.findUnique({ where: { id: req.quoteId } });
+  if (!quote) throw new Error("Quote not found");
+  if (quote.status === "EXECUTED") throw new Error("Quote already used");
+  if (quote.expiresAt < new Date()) throw new Error("Quote expired");
+
+  // Check if there's already an execution for this quote
+  let execution = await prisma.execution.findFirst({
+    where: { quoteId: quote.id },
+    include: { steps: { orderBy: { stepIndex: "asc" } } },
   });
 
-  if (!quote) {
-    throw new Error("Quote not found. Please request a new quote.");
+  if (!execution) {
+    // Create new execution and all steps from the stored route
+    const routeData = quote.routeData as any;
+    const stepsRaw = routeData.includedSteps ?? [];
+
+    execution = await prisma.$transaction(async (tx) => {
+      const exec = await tx.execution.create({
+        data: {
+          quoteId: quote.id,
+          userAddress: req.userAddress,
+          recipientAddress: req.recipientAddress,
+          status: ExecutionStatus.PENDING,
+          currentStepIndex: 0,
+        },
+      });
+
+      for (let i = 0; i < stepsRaw.length; i++) {
+        const step = stepsRaw[i];
+        // Build the transaction for this step (LI.FI will give us the latest)
+        const txReq = await lifi.buildStepTransaction(
+          routeData,
+          i,
+          req.userAddress,
+          req.recipientAddress
+        );
+        if (!txReq) {
+          throw new Error(`Failed to build transaction for step ${i}`);
+        }
+
+        await tx.step.create({
+          data: {
+            executionId: exec.id,
+            stepIndex: i,
+            type: step.type, // "approval", "swap", "cross"
+            status: StepStatus.PENDING,
+            transactionRequest: txReq,
+          },
+        });
+      }
+      return exec;
+    });
+
+    // Re-fetch with steps
+    execution = await prisma.execution.findUnique({
+      where: { id: execution.id },
+      include: { steps: { orderBy: { stepIndex: "asc" } } },
+    })!;
   }
-  if (quote.status === "EXECUTED") {
-    throw new Error("This quote has already been used. Please request a new quote.");
+
+  // Determine the current step
+  const currentStep = execution!.steps.find(s => s.stepIndex === execution!.currentStepIndex);
+  if (!currentStep) throw new Error("No steps found for this execution");
+
+  // If current step is already SUBMITTED or CONFIRMED, we need to advance or wait
+  if (currentStep.status === StepStatus.SUBMITTED) {
+    throw new Error("Step already submitted, waiting for confirmation");
   }
-  if (quote.expiresAt < new Date()) {
-    throw new Error("Quote expired. Please request a fresh quote.");
+  if (currentStep.status === StepStatus.CONFIRMED) {
+    // Move to next step automatically (should be done by poller, but just in case)
+    await advanceToNextStep(execution!.id);
+    // Re-fetch execution and retry
+    return prepareExecution(req);
   }
-
-  // ── NEW: Check if this quote is already being processed by another execution
-  const existingExecution = await prisma.execution.findFirst({
-    where: { 
-      quoteId: quote.id,
-      status: { in: ["PENDING", "BRIDGING"] }
-    }
-  });
-
-  if (existingExecution) {
-    throw new Error("This quote is already being processed. Please request a new quote.");
+  if (currentStep.status === StepStatus.COMPLETED) {
+    throw new Error("Execution already completed");
   }
-
-  // ── Build transaction ─────────────────────────────
-  const txReq = await lifi.buildTransaction(
-    quote.routeData as Record<string, unknown>,
-    req.userAddress,
-    req.recipientAddress
-  );
-
-  if (!txReq) {
-    throw new Error("Unable to build transaction. The route may no longer be available — please get a new quote.");
-  }
-
-  // ── Create execution (still do NOT mark quote EXECUTED yet)
-  const execution = await prisma.execution.create({
-    data: {
-      quoteId: quote.id,
-      userAddress: req.userAddress,
-      recipientAddress: req.recipientAddress,
-      status: ExecutionStatus.PENDING,
-    },
-  });
-
-  logger.info({ 
-    executionId: execution.id, 
-    quoteId: quote.id 
-  }, "Execution prepared");
 
   const appUrl = process.env.FRONTEND_URL || "http://localhost:3000";
-
   return {
-    executionId: execution.id,
-    trackingUrl: `${appUrl}/bridge/status/${execution.id}`,
-    transactionRequest: txReq,
+    executionId: execution!.id,
+    trackingUrl: `${appUrl}/bridge/status/${execution!.id}`,
+    stepIndex: currentStep.stepIndex,
+    stepType: currentStep.type,
+    transactionRequest: currentStep.transactionRequest as any,
   };
 }
 
 /**
- * Called by the frontend after the user has signed and broadcast the tx.
- * Stores the hash and queues status polling.
+ * After user submits a transaction hash for the current step.
+ * Records the hash and updates step status to SUBMITTED.
  */
-export async function submitTxHash(executionId: string, txHash: string): Promise<void> {
+export async function submitStepTxHash(executionId: string, txHash: string): Promise<void> {
   const execution = await prisma.execution.findUnique({
     where: { id: executionId },
-    include: { quote: true }
+    include: { steps: true },
+  });
+  if (!execution) throw new Error("Execution not found");
+
+  const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
+  if (!currentStep) throw new Error("No current step");
+  if (currentStep.status !== StepStatus.PENDING) {
+    throw new Error("Step already submitted or completed");
+  }
+
+  await prisma.step.update({
+    where: { id: currentStep.id },
+    data: {
+      txHash,
+      status: StepStatus.SUBMITTED,
+    },
   });
 
-  if (!execution) throw new Error("Execution not found");
-  if (execution.txHash) return; // already submitted
-
-  await prisma.$transaction([
-    prisma.execution.update({
+  // Also update execution status to BRIDGING
+  if (execution.status === ExecutionStatus.PENDING) {
+    await prisma.execution.update({
       where: { id: executionId },
-      data: { txHash, status: ExecutionStatus.BRIDGING },
-    }),
-    prisma.quote.update({
-      where: { id: execution.quoteId },
-      data: { status: "EXECUTED" },
-    }),
-  ]);
+      data: { status: ExecutionStatus.BRIDGING },
+    });
+  }
 
-  logger.info({ executionId, txHash, quoteId: execution.quoteId }, "Tx submitted successfully");
+  logger.info({ executionId, stepIndex: currentStep.stepIndex, txHash }, "Step tx submitted");
+}
+
+/**
+ * Advance to the next step if the current step is confirmed.
+ * Called by the background poller.
+ */
+export async function advanceToNextStep(executionId: string): Promise<boolean> {
+  const execution = await prisma.execution.findUnique({
+    where: { id: executionId },
+    include: { steps: { orderBy: { stepIndex: "asc" } } },
+  });
+  if (!execution) return false;
+
+  const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
+  if (!currentStep) return false;
+
+  // If current step is not confirmed, cannot advance
+  if (currentStep.status !== StepStatus.CONFIRMED && currentStep.status !== StepStatus.COMPLETED) {
+    return false;
+  }
+
+  // Mark current step as COMPLETED
+  if (currentStep.status === StepStatus.CONFIRMED) {
+    await prisma.step.update({
+      where: { id: currentStep.id },
+      data: { status: StepStatus.COMPLETED, completedAt: new Date() },
+    });
+  }
+
+  const nextIndex = execution.currentStepIndex + 1;
+  if (nextIndex >= execution.steps.length) {
+    // All steps finished
+    await prisma.execution.update({
+      where: { id: executionId },
+      data: {
+        status: ExecutionStatus.SUCCESS,
+        completedAt: new Date(),
+        durationMs: new Date().getTime() - execution.createdAt.getTime(),
+      },
+    });
+    logger.info({ executionId }, "Execution completed successfully");
+    return true;
+  }
+
+  // Move to next step
+  await prisma.execution.update({
+    where: { id: executionId },
+    data: { currentStepIndex: nextIndex },
+  });
+
+  logger.info({ executionId, nextStepIndex: nextIndex }, "Advanced to next step");
+  return true;
+}
+
+/**
+ * Poll a specific step's transaction status.
+ * Called by background poller.
+ */
+export async function pollStepStatus(stepId: string): Promise<boolean> {
+  const step = await prisma.step.findUnique({
+    where: { id: stepId },
+    include: { execution: true },
+  });
+  if (!step) return false;
+  if (step.status !== StepStatus.SUBMITTED) return true; // already done
+
+  const execution = step.execution;
+  const quote = await prisma.quote.findUnique({ where: { id: execution.quoteId } });
+  if (!quote) return false;
+
+  const txReq = step.transactionRequest as any;
+  const chainId = txReq.chainId;
+  const status = await lifi.getStepStatus(step.txHash!, chainId, step.type);
+
+  if (status === "CONFIRMED" || status === "SUCCESS") {
+    await prisma.step.update({
+      where: { id: step.id },
+      data: { status: StepStatus.CONFIRMED },
+    });
+    // Try to advance to next step immediately
+    await advanceToNextStep(execution.id);
+    return true;
+  } else if (status === "FAILED") {
+    await prisma.step.update({
+      where: { id: step.id },
+      data: { status: StepStatus.FAILED, errorMessage: "Transaction failed on chain" },
+    });
+    await prisma.execution.update({
+      where: { id: execution.id },
+      data: { status: ExecutionStatus.FAILED, errorMessage: `Step ${step.stepIndex} failed` },
+    });
+    logger.warn({ stepId, txHash: step.txHash }, "Step failed");
+    return true;
+  }
+  return false; // still pending
 }
 
 /** Get full execution status for the status page */
 export async function getExecution(executionId: string) {
   return prisma.execution.findUnique({
     where: { id: executionId },
-    include: { quote: true },
+    include: { quote: true, steps: true },
   });
 }
 
 /** Paginated execution history for a wallet address */
 export async function getExecutionsByAddress(address: string, page = 1, limit = 20) {
   const skip = (page - 1) * limit;
-
   const [items, total] = await Promise.all([
     prisma.execution.findMany({
       where: { userAddress: { equals: address, mode: "insensitive" } },
-      include: { quote: true },
+      include: { quote: true, steps: true },
       orderBy: { createdAt: "desc" },
       skip,
       take: limit,
@@ -151,53 +282,5 @@ export async function getExecutionsByAddress(address: string, page = 1, limit = 
       where: { userAddress: { equals: address, mode: "insensitive" } },
     }),
   ]);
-
   return { items, total, page, limit, pages: Math.ceil(total / limit) };
-}
-
-/**
- * Internal: poll LI.FI for a single execution and update its status.
- * Called by the background polling worker.
- */
-export async function pollExecutionStatus(executionId: string): Promise<boolean> {
-  const execution = await prisma.execution.findUnique({
-    where: { id: executionId },
-    include: { quote: true },
-  });
-
-  if (!execution || !execution.txHash) return false;
-  if (execution.status === "SUCCESS" || execution.status === "FAILED") return true; // already done
-
-  const status = await lifi.getStatus(
-    execution.txHash,
-    execution.quote.fromChainId,
-    execution.quote.toChainId
-  );
-
-  logger.debug({ executionId, txHash: execution.txHash, status }, "Polled execution");
-
-  if (status === "SUCCESS") {
-    const completedAt = new Date();
-    await prisma.execution.update({
-      where: { id: executionId },
-      data: {
-        status: ExecutionStatus.SUCCESS,
-        completedAt,
-        durationMs: completedAt.getTime() - execution.createdAt.getTime(),
-      },
-    });
-    logger.info({ executionId }, "✓ Execution completed successfully");
-    return true;
-  }
-
-  if (status === "FAILED") {
-    await prisma.execution.update({
-      where: { id: executionId },
-      data: { status: ExecutionStatus.FAILED, errorMessage: "Bridge transaction failed" },
-    });
-    logger.warn({ executionId }, "✗ Execution failed");
-    return true;
-  }
-
-  return false;
 }
