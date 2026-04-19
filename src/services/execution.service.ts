@@ -1,17 +1,10 @@
 /**
- * Execution Service — handles multi‑step bridge execution lifecycle (v0.3 Fixed)
+ * Execution Service — handles multi‑step bridge execution lifecycle (v0.3 Fixed + Improved)
  *
- * Changes made:
- * - Uses safe transactionRequest extraction from quote (no /buildTx endpoint)
- * - Robust multi-step preparation
- * - Better error handling and logging
- * - Compatible with current LI.FI API (2026)
- *
- * Flow:
- * 1. Frontend calls POST /v1/execute → prepares execution + all steps
- * 2. Returns first pending step's transactionRequest
- * 3. User signs & broadcasts → frontend calls /submit-step with txHash
- * 4. Background poller detects confirmation → advances to next step
+ * Improvements in this version:
+ * - Better logging for failed steps (includes full LI.FI status)
+ * - Detects approval steps and gives clearer error messages
+ * - More robust polling
  */
 
 import { ExecutionStatus, StepStatus } from "@prisma/client";
@@ -41,17 +34,12 @@ export interface ExecuteResponse {
   };
 }
 
-/**
- * Prepares (or resumes) an execution for a quote.
- * Builds all step transactions on first run using safe extraction.
- */
 export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResponse> {
   const quote = await prisma.quote.findUnique({ where: { id: req.quoteId } });
   if (!quote) throw new Error("Quote not found");
   if (quote.status === "EXECUTED") throw new Error("Quote already used");
   if (quote.expiresAt < new Date()) throw new Error("Quote expired");
 
-  // Check if execution already exists for this quote
   let execution = await prisma.execution.findFirst({
     where: { quoteId: quote.id },
     include: { steps: { orderBy: { stepIndex: "asc" } } },
@@ -62,7 +50,7 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
     const stepsRaw = routeData.includedSteps ?? [];
 
     if (stepsRaw.length === 0) {
-      throw new Error("No steps found in LI.FI route. Route may be invalid.");
+      throw new Error("No steps found in LI.FI route");
     }
 
     const newExecution = await prisma.$transaction(async (tx) => {
@@ -76,11 +64,10 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
         },
       });
 
-      // Build transaction for every step
       for (let i = 0; i < stepsRaw.length; i++) {
         const step = stepsRaw[i];
 
-        const txReq: LifiTransactionResult = await lifi.buildStepTransaction(
+        const txReq = await lifi.buildStepTransaction(
           routeData,
           i,
           req.userAddress,
@@ -107,7 +94,6 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
           },
         });
       }
-
       return exec;
     });
 
@@ -119,16 +105,12 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
     if (!execution) throw new Error("Failed to retrieve created execution");
   }
 
-  const currentStep = execution.steps.find(
-    (s) => s.stepIndex === execution!.currentStepIndex
-  );
+  const currentStep = execution.steps.find(s => s.stepIndex === execution!.currentStepIndex);
+  if (!currentStep) throw new Error("No current step found");
 
-  if (!currentStep) throw new Error("No steps found in execution");
-
-  // Handle already confirmed steps
   if (currentStep.status === StepStatus.CONFIRMED) {
     await advanceToNextStep(execution.id);
-    return prepareExecution(req); // recurse to fetch next step
+    return prepareExecution(req);
   }
 
   if (currentStep.status === StepStatus.COMPLETED) {
@@ -150,9 +132,6 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
   };
 }
 
-/**
- * Called by frontend after user signs and broadcasts a step transaction
- */
 export async function submitStepTxHash(executionId: string, txHash: string): Promise<void> {
   const execution = await prisma.execution.findUnique({
     where: { id: executionId },
@@ -160,10 +139,8 @@ export async function submitStepTxHash(executionId: string, txHash: string): Pro
   });
   if (!execution) throw new Error("Execution not found");
 
-  const currentStep = execution.steps.find(
-    (s) => s.stepIndex === execution.currentStepIndex
-  );
-  if (!currentStep) throw new Error("No current step found");
+  const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
+  if (!currentStep) throw new Error("No current step");
 
   if (currentStep.status !== StepStatus.PENDING) {
     throw new Error("Step already submitted or completed");
@@ -181,15 +158,9 @@ export async function submitStepTxHash(executionId: string, txHash: string): Pro
     });
   }
 
-  logger.info(
-    { executionId, stepIndex: currentStep.stepIndex, txHash },
-    "Step tx submitted successfully"
-  );
+  logger.info({ executionId, stepIndex: currentStep.stepIndex, txHash }, "Step tx submitted successfully");
 }
 
-/**
- * Advances execution to the next step after confirmation
- */
 export async function advanceToNextStep(executionId: string): Promise<boolean> {
   const execution = await prisma.execution.findUnique({
     where: { id: executionId },
@@ -197,16 +168,13 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
   });
   if (!execution) return false;
 
-  const currentStep = execution.steps.find(
-    (s) => s.stepIndex === execution.currentStepIndex
-  );
+  const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
   if (!currentStep) return false;
 
   if (currentStep.status !== StepStatus.CONFIRMED && currentStep.status !== StepStatus.COMPLETED) {
     return false;
   }
 
-  // Mark current step as COMPLETED
   if (currentStep.status === StepStatus.CONFIRMED) {
     await prisma.step.update({
       where: { id: currentStep.id },
@@ -216,7 +184,6 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
 
   const nextIndex = execution.currentStepIndex + 1;
 
-  // All steps done → mark execution as SUCCESS
   if (nextIndex >= execution.steps.length) {
     await prisma.execution.update({
       where: { id: executionId },
@@ -230,7 +197,6 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
     return true;
   }
 
-  // Move to next step
   await prisma.execution.update({
     where: { id: executionId },
     data: { currentStepIndex: nextIndex },
@@ -241,62 +207,75 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
 }
 
 /**
- * Polls LI.FI status for a submitted step and updates DB accordingly
+ * Improved pollStepStatus with better logging
  */
 export async function pollStepStatus(stepId: string): Promise<boolean> {
   const step = await prisma.step.findUnique({
     where: { id: stepId },
     include: { execution: true },
   });
-  if (!step) return false;
+  if (!step || !step.txHash) return false;
 
   if (step.status !== StepStatus.SUBMITTED) return true;
 
   const execution = step.execution;
-  const quote = await prisma.quote.findUnique({ where: { id: execution.quoteId } });
-  if (!quote) return false;
-
   const txReq = step.transactionRequest as any;
   const chainId = txReq.chainId;
 
-  const status = await lifi.getStepStatus(step.txHash!, chainId, step.type);
+  try {
+    const status = await lifi.getStepStatus(step.txHash, chainId, step.type);
 
-  if (status === "CONFIRMED" || status === "SUCCESS") {
-    await prisma.step.update({
-      where: { id: step.id },
-      data: { status: StepStatus.CONFIRMED },
-    });
+    logger.debug({ 
+      stepId, 
+      txHash: step.txHash, 
+      stepType: step.type, 
+      status 
+    }, "Polled step status");
 
-    await advanceToNextStep(execution.id);
-    return true;
-  } 
-  else if (status === "FAILED") {
-    await prisma.step.update({
-      where: { id: step.id },
-      data: { 
-        status: StepStatus.FAILED, 
-        errorMessage: "Transaction failed on chain" 
-      },
-    });
+    if (status === "CONFIRMED" || status === "SUCCESS") {
+      await prisma.step.update({
+        where: { id: step.id },
+        data: { status: StepStatus.CONFIRMED },
+      });
+      await advanceToNextStep(execution.id);
+      return true;
+    } 
+    else if (status === "FAILED") {
+      const isApproval = step.type.toLowerCase().includes("approval") || step.stepIndex === 0;
 
-    await prisma.execution.update({
-      where: { id: execution.id },
-      data: { 
-        status: ExecutionStatus.FAILED, 
-        errorMessage: `Step ${step.stepIndex} failed` 
-      },
-    });
+      await prisma.step.update({
+        where: { id: step.id },
+        data: { 
+          status: StepStatus.FAILED, 
+          errorMessage: isApproval 
+            ? "Approval transaction failed. Please approve USDT to LI.FI Diamond contract." 
+            : "Transaction failed on chain" 
+        },
+      });
 
-    logger.warn({ stepId, txHash: step.txHash }, "Step failed on chain");
-    return true;
+      await prisma.execution.update({
+        where: { id: execution.id },
+        data: { 
+          status: ExecutionStatus.FAILED, 
+          errorMessage: `Step ${step.stepIndex} failed (${step.type})` 
+        },
+      });
+
+      logger.warn({ 
+        stepId, 
+        txHash: step.txHash, 
+        stepType: step.type,
+        isApproval 
+      }, "Step failed on chain");
+      return true;
+    }
+  } catch (err) {
+    logger.error({ stepId, err }, "Error polling step status");
   }
 
-  return false; // still pending
+  return false;
 }
 
-/**
- * Get full execution details (used by status page)
- */
 export async function getExecution(executionId: string) {
   return prisma.execution.findUnique({
     where: { id: executionId },
@@ -304,12 +283,8 @@ export async function getExecution(executionId: string) {
   });
 }
 
-/**
- * Get paginated execution history for a wallet
- */
 export async function getExecutionsByAddress(address: string, page = 1, limit = 20) {
   const skip = (page - 1) * limit;
-
   const [items, total] = await Promise.all([
     prisma.execution.findMany({
       where: { userAddress: { equals: address, mode: "insensitive" } },
@@ -323,11 +298,5 @@ export async function getExecutionsByAddress(address: string, page = 1, limit = 
     }),
   ]);
 
-  return { 
-    items, 
-    total, 
-    page, 
-    limit, 
-    pages: Math.ceil(total / limit) 
-  };
+  return { items, total, page, limit, pages: Math.ceil(total / limit) };
 }
