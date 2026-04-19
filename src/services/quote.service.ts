@@ -119,7 +119,7 @@ export async function buildQuote(req: QuoteRequest): Promise<QuoteResponse> {
 
   // ── Persist quote ────────────────────────────────────────────
   const quoteId = nanoid(16);
-  const expiresAt = new Date(Date.now() + 30_000); // 30 second TTL
+  const expiresAt = new Date(Date.now() + 180_000); // 3 minute TTL
 
   try {
     await prisma.quote.create({
