@@ -81,7 +81,7 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
         }
 
         // Convert LifiTransactionResult to a plain object for JSON storage
-        const txReqPlain: Record<string, unknown> = {
+        const txReqPlain = {
           to: txReq.to,
           from: txReq.from,
           data: txReq.data,
@@ -97,7 +97,7 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
             stepIndex: i,
             type: step.type, // "approval", "swap", "cross"
             status: StepStatus.PENDING,
-            transactionRequest: txReqPlain, // Prisma accepts JsonValue
+            transactionRequest: txReqPlain as any, // ✅ Fix: cast to any for Prisma JsonValue
           },
         });
       }
