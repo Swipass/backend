@@ -1,9 +1,12 @@
 /**
- * LI.FI Adapter — v0.3 (Reliable /buildTx only)
+ * LI.FI Adapter — v0.3 (Reliable extraction, no /buildTx)
  *
- * - Uses /buildTx exclusively (no fallback).
- * - Logs full request/response on error.
- * - Throws if /buildTx fails.
+ * Changes from previous version:
+ * - Removed broken /buildTx POST (LI.FI no longer supports it reliably in 2026)
+ * - Now extracts transactionRequest directly from the stored quote (official pattern)
+ * - Robust fallback for multi-step routes
+ * - Better logging for debugging
+ * - Throws clear errors instead of silent failures
  */
 
 import axios, { AxiosInstance } from "axios";
@@ -75,7 +78,7 @@ export class LifiAdapter {
       const data = res.data;
       const bridges: string[] = [];
       for (const step of data.includedSteps ?? []) {
-        if (step.type === "cross" && step.tool) bridges.push(step.tool);
+        if (step.type === "cross" && step.tool) bridges.push(step.tool as string);
       }
 
       return {
@@ -92,14 +95,14 @@ export class LifiAdapter {
         logger.info({ req }, "LI.FI: no route available");
         return null;
       }
-      logger.error({ err: err.message }, "LI.FI getQuote failed");
+      logger.error({ err: err.message, req }, "LI.FI getQuote failed");
       return null;
     }
   }
 
   /**
-   * Build transaction for a specific step using LI.FI's /buildTx endpoint.
-   * Throws if it fails – no fallback.
+   * Extract transactionRequest for a specific step from the stored route.
+   * This is the current recommended way (no /buildTx needed).
    */
   async buildStepTransaction(
     route: Record<string, unknown>,
@@ -107,41 +110,45 @@ export class LifiAdapter {
     fromAddress: string,
     toAddress: string
   ): Promise<LifiTransactionResult> {
-    const payload = {
-      route,
-      fromAddress,
-      toAddress,
-      step: stepIndex,
-      integrator: "swipass",
-    };
-
     try {
-      const response = await this.http.post("/buildTx", payload);
-      const tx = response.data.transactionRequest;
-      if (!tx) {
-        throw new Error("No transactionRequest in /buildTx response");
+      const routeData = route as any;
+      let txReq = routeData.transactionRequest;
+
+      // Multi-step routes store tx per step
+      if (!txReq && routeData.includedSteps?.length > stepIndex) {
+        txReq = routeData.includedSteps[stepIndex]?.transactionRequest;
       }
 
-      logger.info({ stepIndex, to: tx.to, chainId: tx.chainId }, "/buildTx success");
+      // Final fallback (rare)
+      if (!txReq) {
+        logger.warn({ stepIndex, hasIncludedSteps: !!routeData.includedSteps }, "No transactionRequest found in route");
+        throw new Error("No transactionRequest available in LI.FI route for this step");
+      }
+
+      logger.info({
+        stepIndex,
+        to: txReq.to,
+        chainId: txReq.chainId,
+        hasData: !!txReq.data,
+      }, "Transaction request extracted successfully");
+
       return {
-        to: tx.to,
+        to: txReq.to,
         from: fromAddress,
-        data: tx.data,
-        value: tx.value ?? "0x0",
-        gasLimit: tx.gasLimit ?? "0x0",
-        gasPrice: tx.gasPrice,
-        chainId: tx.chainId,
+        data: txReq.data,
+        value: txReq.value ?? "0x0",
+        gasLimit: txReq.gasLimit ?? "0x0",
+        gasPrice: txReq.gasPrice,
+        chainId: txReq.chainId,
       };
     } catch (err: any) {
-      // Log the full request and response for debugging
       logger.error({
         stepIndex,
         error: err.message,
-        responseStatus: err.response?.status,
-        responseData: err.response?.data,
-        requestPayload: { ...payload, route: "[[stored route object]]" }, // hide huge route
-      }, "/buildTx failed");
-      throw new Error(`LI.FI /buildTx failed for step ${stepIndex}: ${err.message}`);
+        routeHasTransactionRequest: !!(route as any).transactionRequest,
+        includedStepsCount: (route as any).includedSteps?.length ?? 0,
+      }, "Failed to extract transactionRequest");
+      throw new Error(`Failed to get tx for step ${stepIndex}: ${err.message}`);
     }
   }
 
@@ -154,8 +161,11 @@ export class LifiAdapter {
       const res = await this.http.get("/status", {
         params: { txHash, fromChain: chainId, toChain: chainId },
       });
-      const status = res.data?.status;
-      if (status === "DONE") return stepType === "approval" ? "CONFIRMED" : "SUCCESS";
+      const status = res.data?.status as string;
+
+      if (status === "DONE") {
+        return stepType === "approval" ? "CONFIRMED" : "SUCCESS";
+      }
       if (status === "FAILED") return "FAILED";
       return "PENDING";
     } catch {
