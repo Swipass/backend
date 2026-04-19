@@ -16,7 +16,7 @@ import { logger } from "../utils/logger";
 export interface ExecuteRequest {
   quoteId: string;
   userAddress: string;
-  recipientAddress: string; // may equal userAddress
+  recipientAddress: string;
 }
 
 export interface ExecuteResponse {
@@ -35,24 +35,18 @@ export interface ExecuteResponse {
   };
 }
 
-/**
- * Prepares the first pending step of an execution.
- * If no execution exists, creates one and returns the first transaction.
- */
 export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResponse> {
   const quote = await prisma.quote.findUnique({ where: { id: req.quoteId } });
   if (!quote) throw new Error("Quote not found");
   if (quote.status === "EXECUTED") throw new Error("Quote already used");
   if (quote.expiresAt < new Date()) throw new Error("Quote expired");
 
-  // Check if there's already an execution for this quote
   let execution = await prisma.execution.findFirst({
     where: { quoteId: quote.id },
     include: { steps: { orderBy: { stepIndex: "asc" } } },
   });
 
   if (!execution) {
-    // Create new execution and all steps from the stored route
     const routeData = quote.routeData as any;
     const stepsRaw = routeData.includedSteps ?? [];
 
@@ -69,18 +63,14 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
 
       for (let i = 0; i < stepsRaw.length; i++) {
         const step = stepsRaw[i];
-        // Build the transaction for this step (LI.FI will give us the latest)
+        // Always call /buildTx – no fallback
         const txReq = await lifi.buildStepTransaction(
           routeData,
           i,
           req.userAddress,
           req.recipientAddress
         );
-        if (!txReq) {
-          throw new Error(`Failed to build transaction for step ${i}`);
-        }
 
-        // Convert LifiTransactionResult to a plain object for JSON storage
         const txReqPlain = {
           to: txReq.to,
           from: txReq.from,
@@ -95,16 +85,15 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
           data: {
             executionId: exec.id,
             stepIndex: i,
-            type: step.type, // "approval", "swap", "cross"
+            type: step.type,
             status: StepStatus.PENDING,
-            transactionRequest: txReqPlain as any, // ✅ Fix: cast to any for Prisma JsonValue
+            transactionRequest: txReqPlain as any,
           },
         });
       }
       return exec;
     });
 
-    // Re-fetch with steps (non-null assertion safe because we just created it)
     execution = await prisma.execution.findUnique({
       where: { id: newExecution.id },
       include: { steps: { orderBy: { stepIndex: "asc" } } },
@@ -112,18 +101,14 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
     if (!execution) throw new Error("Failed to retrieve created execution");
   }
 
-  // Determine the current step
   const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
-  if (!currentStep) throw new Error("No steps found for this execution");
+  if (!currentStep) throw new Error("No steps found");
 
-  // If current step is already SUBMITTED or CONFIRMED, we need to advance or wait
   if (currentStep.status === StepStatus.SUBMITTED) {
     throw new Error("Step already submitted, waiting for confirmation");
   }
   if (currentStep.status === StepStatus.CONFIRMED) {
-    // Move to next step automatically (should be done by poller, but just in case)
     await advanceToNextStep(execution.id);
-    // Re-fetch execution and retry
     return prepareExecution(req);
   }
   if (currentStep.status === StepStatus.COMPLETED) {
@@ -140,10 +125,6 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
   };
 }
 
-/**
- * After user submits a transaction hash for the current step.
- * Records the hash and updates step status to SUBMITTED.
- */
 export async function submitStepTxHash(executionId: string, txHash: string): Promise<void> {
   const execution = await prisma.execution.findUnique({
     where: { id: executionId },
@@ -159,13 +140,9 @@ export async function submitStepTxHash(executionId: string, txHash: string): Pro
 
   await prisma.step.update({
     where: { id: currentStep.id },
-    data: {
-      txHash,
-      status: StepStatus.SUBMITTED,
-    },
+    data: { txHash, status: StepStatus.SUBMITTED },
   });
 
-  // Also update execution status to BRIDGING
   if (execution.status === ExecutionStatus.PENDING) {
     await prisma.execution.update({
       where: { id: executionId },
@@ -176,10 +153,6 @@ export async function submitStepTxHash(executionId: string, txHash: string): Pro
   logger.info({ executionId, stepIndex: currentStep.stepIndex, txHash }, "Step tx submitted");
 }
 
-/**
- * Advance to the next step if the current step is confirmed.
- * Called by the background poller.
- */
 export async function advanceToNextStep(executionId: string): Promise<boolean> {
   const execution = await prisma.execution.findUnique({
     where: { id: executionId },
@@ -189,13 +162,10 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
 
   const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
   if (!currentStep) return false;
-
-  // If current step is not confirmed, cannot advance
   if (currentStep.status !== StepStatus.CONFIRMED && currentStep.status !== StepStatus.COMPLETED) {
     return false;
   }
 
-  // Mark current step as COMPLETED
   if (currentStep.status === StepStatus.CONFIRMED) {
     await prisma.step.update({
       where: { id: currentStep.id },
@@ -205,7 +175,6 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
 
   const nextIndex = execution.currentStepIndex + 1;
   if (nextIndex >= execution.steps.length) {
-    // All steps finished
     await prisma.execution.update({
       where: { id: executionId },
       data: {
@@ -218,27 +187,21 @@ export async function advanceToNextStep(executionId: string): Promise<boolean> {
     return true;
   }
 
-  // Move to next step
   await prisma.execution.update({
     where: { id: executionId },
     data: { currentStepIndex: nextIndex },
   });
-
   logger.info({ executionId, nextStepIndex: nextIndex }, "Advanced to next step");
   return true;
 }
 
-/**
- * Poll a specific step's transaction status.
- * Called by background poller.
- */
 export async function pollStepStatus(stepId: string): Promise<boolean> {
   const step = await prisma.step.findUnique({
     where: { id: stepId },
     include: { execution: true },
   });
   if (!step) return false;
-  if (step.status !== StepStatus.SUBMITTED) return true; // already done
+  if (step.status !== StepStatus.SUBMITTED) return true;
 
   const execution = step.execution;
   const quote = await prisma.quote.findUnique({ where: { id: execution.quoteId } });
@@ -253,7 +216,6 @@ export async function pollStepStatus(stepId: string): Promise<boolean> {
       where: { id: step.id },
       data: { status: StepStatus.CONFIRMED },
     });
-    // Try to advance to next step immediately
     await advanceToNextStep(execution.id);
     return true;
   } else if (status === "FAILED") {
@@ -268,10 +230,9 @@ export async function pollStepStatus(stepId: string): Promise<boolean> {
     logger.warn({ stepId, txHash: step.txHash }, "Step failed");
     return true;
   }
-  return false; // still pending
+  return false;
 }
 
-/** Get full execution status for the status page */
 export async function getExecution(executionId: string) {
   return prisma.execution.findUnique({
     where: { id: executionId },
@@ -279,7 +240,6 @@ export async function getExecution(executionId: string) {
   });
 }
 
-/** Paginated execution history for a wallet address */
 export async function getExecutionsByAddress(address: string, page = 1, limit = 20) {
   const skip = (page - 1) * limit;
   const [items, total] = await Promise.all([
