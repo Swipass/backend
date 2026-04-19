@@ -1,52 +1,58 @@
 /**
- * Status Poller — polls LI.FI every 10 seconds for in-flight executions.
+ * Status Poller — polls LI.FI every 5 seconds for in‑flight step transactions.
  *
  * Uses a simple DB query + cron rather than BullMQ to reduce dependencies.
  * For high volume (1000+ concurrent bridges) switch to BullMQ.
  */
 import cron from "node-cron";
 import { prisma } from "../lib/database";
-import { pollExecutionStatus } from "../services/execution.service";
+import { pollStepStatus, advanceToNextStep } from "../services/execution.service";
 import { logger } from "../utils/logger";
 
 let isRunning = false;
 
-async function pollAll(): Promise<void> {
-  if (isRunning) return; // prevent overlap
+async function pollAllSteps(): Promise<void> {
+  if (isRunning) return;
   isRunning = true;
 
   try {
-    // Find all executions that are in-flight
-    const pending = await prisma.execution.findMany({
+    // Find all steps that are SUBMITTED and not too old
+    const submittedSteps = await prisma.step.findMany({
       where: {
-        status: { in: ["BRIDGING"] },
-        txHash: { not: null },
-        // Don't poll executions older than 30 minutes — they've likely failed
+        status: "SUBMITTED",
         createdAt: { gte: new Date(Date.now() - 30 * 60_000) },
       },
       select: { id: true },
     });
 
-    if (pending.length === 0) return;
+    for (const step of submittedSteps) {
+      await pollStepStatus(step.id);
+    }
 
-    logger.debug({ count: pending.length }, "Polling in-flight executions");
+    // Also check for any executions that might have stuck steps (e.g., confirmed but not advanced)
+    const executions = await prisma.execution.findMany({
+      where: {
+        status: "BRIDGING",
+        currentStepIndex: { not: undefined },
+      },
+      include: { steps: true },
+    });
 
-    // Poll each one — we cap concurrency to avoid hammering LI.FI
-    const BATCH = 5;
-    for (let i = 0; i < pending.length; i += BATCH) {
-      const batch = pending.slice(i, i + BATCH);
-      await Promise.allSettled(batch.map((e) => pollExecutionStatus(e.id)));
+    for (const exec of executions) {
+      const currentStep = exec.steps.find(s => s.stepIndex === exec.currentStepIndex);
+      if (currentStep && currentStep.status === "CONFIRMED") {
+        await advanceToNextStep(exec.id);
+      }
     }
   } catch (err) {
-    logger.error({ err }, "Status poller error");
+    logger.error({ err }, "Poller error");
   } finally {
     isRunning = false;
   }
 }
 
-/** Start the polling cron — runs every 10 seconds */
+/** Start the polling cron — runs every 5 seconds */
 export function startStatusPoller(): void {
-  // Run every 10 seconds
-  cron.schedule("*/10 * * * * *", pollAll);
-  logger.info("✓ Status poller started (every 10s)");
+  cron.schedule("*/5 * * * * *", pollAllSteps);
+  logger.info("✓ Step poller started (every 5s)");
 }

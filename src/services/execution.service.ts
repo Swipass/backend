@@ -10,7 +10,7 @@
  */
 import { ExecutionStatus, StepStatus } from "@prisma/client";
 import { prisma } from "../lib/database";
-import { lifi } from "../adapters/lifi.adapter";
+import { lifi, LifiTransactionResult } from "../adapters/lifi.adapter";
 import { logger } from "../utils/logger";
 
 export interface ExecuteRequest {
@@ -56,7 +56,7 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
     const routeData = quote.routeData as any;
     const stepsRaw = routeData.includedSteps ?? [];
 
-    execution = await prisma.$transaction(async (tx) => {
+    const newExecution = await prisma.$transaction(async (tx) => {
       const exec = await tx.execution.create({
         data: {
           quoteId: quote.id,
@@ -80,28 +80,40 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
           throw new Error(`Failed to build transaction for step ${i}`);
         }
 
+        // Convert LifiTransactionResult to a plain object for JSON storage
+        const txReqPlain: Record<string, unknown> = {
+          to: txReq.to,
+          from: txReq.from,
+          data: txReq.data,
+          value: txReq.value,
+          gasLimit: txReq.gasLimit,
+          gasPrice: txReq.gasPrice,
+          chainId: txReq.chainId,
+        };
+
         await tx.step.create({
           data: {
             executionId: exec.id,
             stepIndex: i,
             type: step.type, // "approval", "swap", "cross"
             status: StepStatus.PENDING,
-            transactionRequest: txReq,
+            transactionRequest: txReqPlain, // Prisma accepts JsonValue
           },
         });
       }
       return exec;
     });
 
-    // Re-fetch with steps
+    // Re-fetch with steps (non-null assertion safe because we just created it)
     execution = await prisma.execution.findUnique({
-      where: { id: execution.id },
+      where: { id: newExecution.id },
       include: { steps: { orderBy: { stepIndex: "asc" } } },
-    })!;
+    });
+    if (!execution) throw new Error("Failed to retrieve created execution");
   }
 
   // Determine the current step
-  const currentStep = execution!.steps.find(s => s.stepIndex === execution!.currentStepIndex);
+  const currentStep = execution.steps.find(s => s.stepIndex === execution.currentStepIndex);
   if (!currentStep) throw new Error("No steps found for this execution");
 
   // If current step is already SUBMITTED or CONFIRMED, we need to advance or wait
@@ -110,7 +122,7 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
   }
   if (currentStep.status === StepStatus.CONFIRMED) {
     // Move to next step automatically (should be done by poller, but just in case)
-    await advanceToNextStep(execution!.id);
+    await advanceToNextStep(execution.id);
     // Re-fetch execution and retry
     return prepareExecution(req);
   }
@@ -120,8 +132,8 @@ export async function prepareExecution(req: ExecuteRequest): Promise<ExecuteResp
 
   const appUrl = process.env.FRONTEND_URL || "http://localhost:3000";
   return {
-    executionId: execution!.id,
-    trackingUrl: `${appUrl}/bridge/status/${execution!.id}`,
+    executionId: execution.id,
+    trackingUrl: `${appUrl}/bridge/status/${execution.id}`,
     stepIndex: currentStep.stepIndex,
     stepType: currentStep.type,
     transactionRequest: currentStep.transactionRequest as any,
